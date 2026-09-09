@@ -1,0 +1,10 @@
+.venv/
+_pycache_/
+*.pyc
+.env
+dataset/raw_images/
+dataset/annotated/
+dataset/sensor_data/
+dataset/navigation/
+*.pt
+*.onnx
