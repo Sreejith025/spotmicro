@@ -1,0 +1,19 @@
+# SpotMicro Autonomous Navigation - Object Detection Dataset Configuration
+# Format: YOLO Dataset Definition
+
+path: .          # Dataset root path relative to data.yaml
+train: images/train  # Train images directory
+val: images/val      # Validation images directory
+test: images/test    # Test images directory
+
+# Number of classes
+nc: 6
+
+# Class names mapping
+names:
+  0: person
+  1: obstacle
+  2: chair
+  3: stairs
+  4: door
+  5: robot
