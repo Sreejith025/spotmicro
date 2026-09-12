@@ -8,3 +8,6 @@ dataset/sensor_data/
 dataset/navigation/
 *.pt
 *.onnx
+dataset/rugd/
+dataset/public/
+dataset/coco_subset/
