@@ -20,6 +20,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import os
+
+TEST_OPERATOR_TOKEN = "test-operator-token-secure-321"
+os.environ["OPERATOR_API_TOKEN"] = TEST_OPERATOR_TOKEN
+
+from web.backend.security import (
+    get_operator_token,
+    get_secret_key,
+    is_development_or_test_environment,
+    is_production_environment,
+    rate_limiter,
+    resolve_cors_origins,
+    validate_command_parameters,
+    validate_logs_limit,
+    verify_operator_token,
+)
 from web.backend.server import app, simulator, socketio
 from web.backend.simulation import Position
 
@@ -29,6 +45,8 @@ class TestWebBackendREST(unittest.TestCase):
 
     def setUp(self):
         self.client = app.test_client()
+        self.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {TEST_OPERATOR_TOKEN}"
+        rate_limiter.reset()
         # Reset simulator state between tests
         simulator.reset_emergency_stop()
         simulator.apply_scenario("nominal")
@@ -91,6 +109,7 @@ class TestWebBackendREST(unittest.TestCase):
 
     def test_valid_commands(self):
         for cmd in ("forward", "backward", "left", "right", "stand", "sit", "stop"):
+            rate_limiter.reset()
             res = self.client.post("/api/commands", json={"command": cmd, "duration": 1.0, "speed": 1.0})
             self.assertEqual(res.status_code, 200)
             data = res.get_json()
@@ -173,7 +192,8 @@ class TestWebBackendWebSocket(unittest.TestCase):
     """Tests for WebSocket real-time events via Flask-SocketIO test client."""
 
     def test_websocket_connection_and_events(self):
-        socket_client = socketio.test_client(app)
+        rate_limiter.reset()
+        socket_client = socketio.test_client(app, auth={"token": TEST_OPERATOR_TOKEN})
         self.assertTrue(socket_client.is_connected())
 
         # Check initial events emitted upon connection
@@ -186,6 +206,7 @@ class TestWebBackendWebSocket(unittest.TestCase):
 
         # Trigger command via REST, verify WebSocket receives command_executed
         http_client = app.test_client()
+        http_client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {TEST_OPERATOR_TOKEN}"
         http_client.post("/api/commands", json={"command": "forward"})
 
         received_after_cmd = socket_client.get_received()
@@ -213,6 +234,8 @@ class TestAutoModePipeline(unittest.TestCase):
 
     def setUp(self):
         self.client = app.test_client()
+        self.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {TEST_OPERATOR_TOKEN}"
+        rate_limiter.reset()
         # Reset to known clean state before each test
         simulator.reset_emergency_stop()
         simulator.disable_auto_mode()
@@ -407,6 +430,8 @@ class TestDestinationAutoPipeline(unittest.TestCase):
 
     def setUp(self):
         self.client = app.test_client()
+        self.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {TEST_OPERATOR_TOKEN}"
+        rate_limiter.reset()
         simulator.reset_emergency_stop()
         simulator.disable_auto_mode()
         simulator.disable_destination_auto()
@@ -660,6 +685,8 @@ class TestDestinationMapCoordinatesAndArbitraryNavigation(unittest.TestCase):
     def setUp(self):
         self.app = app
         self.client = self.app.test_client()
+        self.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {TEST_OPERATOR_TOKEN}"
+        rate_limiter.reset()
         simulator.reset_emergency_stop()
         simulator.dest_state.current_position = Position(0.0, 0.0)
         simulator.dest_state.heading = 0.0
@@ -955,6 +982,7 @@ class TestDestinationMapCoordinatesAndArbitraryNavigation(unittest.TestCase):
 
         for label, lat, lon, exp_x, exp_y in cases:
             with self.subTest(case=label):
+                rate_limiter.reset()
                 x = (lon - origin_lon) * meters_per_deg_lon
                 y = (lat - origin_lat) * meters_per_deg_lat
 
@@ -984,6 +1012,7 @@ class TestDestinationMapCoordinatesAndArbitraryNavigation(unittest.TestCase):
         ]
         for x, y in out_of_bounds_cases:
             with self.subTest(x=x, y=y):
+                rate_limiter.reset()
                 res = self.client.post("/api/destination-auto/destination", json={"x": x, "y": y})
                 self.assertEqual(res.status_code, 400)
                 data = res.get_json()
@@ -1101,6 +1130,7 @@ class TestDestinationMapCoordinatesAndArbitraryNavigation(unittest.TestCase):
 
         for label, x, y in valid_cases:
             with self.subTest(valid_case=label, x=x, y=y):
+                rate_limiter.reset()
                 res = self.client.post("/api/destination-auto/destination", json={"x": x, "y": y, "plan_route": False})
                 self.assertEqual(res.status_code, 200, f"Expected 200 for valid point {label} ({x}, {y})")
                 data = res.get_json()
@@ -1117,6 +1147,7 @@ class TestDestinationMapCoordinatesAndArbitraryNavigation(unittest.TestCase):
 
         for label, x, y in invalid_cases:
             with self.subTest(invalid_case=label, x=x, y=y):
+                rate_limiter.reset()
                 res = self.client.post("/api/destination-auto/destination", json={"x": x, "y": y, "plan_route": False})
                 self.assertEqual(res.status_code, 400, f"Expected 400 for out-of-bounds point {label} ({x}, {y})")
                 data = res.get_json()
@@ -1205,6 +1236,471 @@ class TestDestinationMapCoordinatesAndArbitraryNavigation(unittest.TestCase):
         self.assertEqual(arrived_status["state"], "ARRIVED")
         self.assertEqual(arrived_status["current_command"], "STOP")
         self.assertFalse(arrived_status["movement_authority"])
+
+
+class TestSecurityStage1(unittest.TestCase):
+    """
+    Comprehensive Security Stage 1 tests:
+    - Bearer token authentication on 14 state-changing endpoints
+    - Constant-time HMAC verification
+    - Public read-only GET endpoints
+    - E-Stop priority and auth
+    - Rate limiting per endpoint
+    - Command & Logs parameter validation (rejects NaN/Inf/str/bool/negative)
+    - Strict CORS origins (no wildcards or localhost in production)
+    - Secret key production enforcement
+    - Security headers (nosniff, DENY, Referrer-Policy)
+    - Socket.IO connection authentication
+    - Standardized error handlers without stack traces
+    """
+
+    def setUp(self):
+        self.auth_client = app.test_client()
+        self.auth_client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {TEST_OPERATOR_TOKEN}"
+        self.unauth_client = app.test_client()
+        rate_limiter.reset()
+        simulator.reset_emergency_stop()
+        simulator.disable_auto_mode()
+        simulator.disable_destination_auto()
+        simulator.apply_scenario("nominal")
+
+    def test_unauthenticated_requests_return_401(self):
+        """All 14 state-changing POST endpoints must return 401 when unauthenticated."""
+        endpoints = [
+            ("/api/commands", {"command": "forward"}),
+            ("/api/emergency-stop", None),
+            ("/api/reset-emergency-stop", None),
+            ("/api/simulation/scenario", {"scenario": "nominal"}),
+            ("/api/auto-mode/enable", None),
+            ("/api/auto-mode/disable", None),
+            ("/api/auto-mode/scenario", {"scenario": "nominal"}),
+            ("/api/destination-auto/enable", None),
+            ("/api/destination-auto/disable", None),
+            ("/api/destination-auto/destination", {"destination_id": "KITCHEN"}),
+            ("/api/destination-auto/clear", None),
+            ("/api/destination-auto/start", None),
+            ("/api/destination-auto/stop", None),
+            ("/api/destination-auto/scenario", {"scenario": "destination_nominal"}),
+        ]
+
+        for url, payload in endpoints:
+            with self.subTest(endpoint=url):
+                if payload:
+                    res = self.unauth_client.post(url, json=payload)
+                else:
+                    res = self.unauth_client.post(url)
+                self.assertEqual(res.status_code, 401, f"{url} did not return 401 without auth")
+                data = res.get_json()
+                self.assertEqual(data.get("error"), "Authentication required")
+
+    def test_invalid_bearer_token_returns_401(self):
+        """Requests with invalid Bearer token must return 401."""
+        bad_client = app.test_client()
+        bad_client.environ_base["HTTP_AUTHORIZATION"] = "Bearer wrong-unauthorized-token"
+        res = bad_client.post("/api/commands", json={"command": "forward"})
+        self.assertEqual(res.status_code, 401)
+        self.assertEqual(res.get_json(), {"error": "Authentication required"})
+
+    def test_valid_bearer_token_returns_200(self):
+        """Requests with valid Bearer token succeed."""
+        res = self.auth_client.post("/api/commands", json={"command": "forward"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.get_json().get("status"), "ok")
+
+    def test_public_get_endpoints_accessible_without_auth(self):
+        """Read-only GET endpoints must remain publicly accessible without auth header."""
+        public_endpoints = [
+            "/api/health",
+            "/api/status",
+            "/api/telemetry",
+            "/api/navigation",
+            "/api/auto-mode",
+            "/api/destinations",
+            "/api/destination-auto",
+            "/api/destination-auto/route",
+            "/api/config",
+            "/api/logs",
+        ]
+        for url in public_endpoints:
+            with self.subTest(endpoint=url):
+                res = self.unauth_client.get(url)
+                self.assertEqual(res.status_code, 200, f"{url} failed public access")
+
+    def test_emergency_stop_priority_and_auth(self):
+        """E-Stop requires auth, triggers immediately, and is not throttled by rate limits."""
+        # Unauthenticated returns 401
+        res_unauth = self.unauth_client.post("/api/emergency-stop")
+        self.assertEqual(res_unauth.status_code, 401)
+
+        # Authenticated triggers e-stop
+        res_auth = self.auth_client.post("/api/emergency-stop")
+        self.assertEqual(res_auth.status_code, 200)
+        self.assertTrue(simulator.state.emergency_stop)
+
+        # Emergency Stop must NOT be rate limited even if called repeatedly
+        for _ in range(10):
+            res = self.auth_client.post("/api/emergency-stop")
+            self.assertEqual(res.status_code, 200)
+
+    def test_reset_emergency_stop_rate_limiting(self):
+        """Reset Emergency Stop allows 1 request per 3 seconds; immediate retry returns 429."""
+        # 1st call succeeds
+        res1 = self.auth_client.post("/api/reset-emergency-stop")
+        self.assertEqual(res1.status_code, 200)
+
+        # 2nd call within 3.0s window returns 429
+        res2 = self.auth_client.post("/api/reset-emergency-stop")
+        self.assertEqual(res2.status_code, 429)
+        self.assertEqual(res2.get_json(), {"error": "Rate limit exceeded"})
+
+    def test_commands_rate_limiting(self):
+        """Commands endpoint allows 5 requests per 1s; 6th immediate request returns 429."""
+        for i in range(5):
+            res = self.auth_client.post("/api/commands", json={"command": "forward"})
+            self.assertEqual(res.status_code, 200, f"Request {i+1} failed")
+
+        res_excess = self.auth_client.post("/api/commands", json={"command": "forward"})
+        self.assertEqual(res_excess.status_code, 429)
+        self.assertEqual(res_excess.get_json(), {"error": "Rate limit exceeded"})
+
+    def test_auto_mode_rate_limiting(self):
+        """Auto mode enable endpoint allows 5 requests per 5s; 6th immediate returns 429."""
+        for i in range(5):
+            res = self.auth_client.post("/api/auto-mode/enable")
+            self.assertIn(res.status_code, (200, 400), f"Request {i+1} unexpected status")
+
+        res_excess = self.auth_client.post("/api/auto-mode/enable")
+        self.assertEqual(res_excess.status_code, 429)
+        self.assertEqual(res_excess.get_json(), {"error": "Rate limit exceeded"})
+
+    def test_destination_rate_limiting(self):
+        """Destination selection allows 5 requests per 5s; 6th immediate returns 429."""
+        for i in range(5):
+            res = self.auth_client.post("/api/destination-auto/destination", json={"destination_id": "KITCHEN"})
+            self.assertEqual(res.status_code, 200)
+
+        res_excess = self.auth_client.post("/api/destination-auto/destination", json={"destination_id": "KITCHEN"})
+        self.assertEqual(res_excess.status_code, 429)
+        self.assertEqual(res_excess.get_json(), {"error": "Rate limit exceeded"})
+
+    def test_command_parameter_validation(self):
+        """Validates speed (0.1-2.0) and duration (0.1-5.0), rejecting NaN/Inf/str/bool/out-of-bounds."""
+        invalid_speed_cases = [
+            "fast",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            -0.5,
+            0.05,
+            2.5,
+            True,
+            False,
+        ]
+        for bad_s in invalid_speed_cases:
+            with self.subTest(bad_speed=str(bad_s)):
+                rate_limiter.reset()
+                res = self.auth_client.post("/api/commands", json={"command": "forward", "speed": bad_s})
+                self.assertEqual(res.status_code, 400, f"Speed {bad_s} was not rejected with 400")
+                data = res.get_json()
+                self.assertIn("error", data)
+
+        invalid_duration_cases = [
+            "long",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            -1.0,
+            0.05,
+            6.0,
+            True,
+            False,
+        ]
+        for bad_d in invalid_duration_cases:
+            with self.subTest(bad_duration=str(bad_d)):
+                rate_limiter.reset()
+                res = self.auth_client.post("/api/commands", json={"command": "forward", "duration": bad_d})
+                self.assertEqual(res.status_code, 400, f"Duration {bad_d} was not rejected with 400")
+                data = res.get_json()
+                self.assertIn("error", data)
+
+        # Valid numeric parameters succeed
+        rate_limiter.reset()
+        res_valid = self.auth_client.post("/api/commands", json={"command": "forward", "speed": 1.5, "duration": 2.0})
+        self.assertEqual(res_valid.status_code, 200)
+
+    def test_logs_limit_validation(self):
+        """Validates logs limit (integer between 1 and 100)."""
+        invalid_limits = ["abc", "-1", "0", "101", "5.5", True]
+        for bad_lim in invalid_limits:
+            with self.subTest(bad_limit=str(bad_lim)):
+                res = self.auth_client.get(f"/api/logs?limit={bad_lim}")
+                self.assertEqual(res.status_code, 400, f"Limit {bad_lim} was not rejected with 400")
+                data = res.get_json()
+                self.assertIn("error", data)
+
+        valid_limits = ["1", "50", "100", 25]
+        for good_lim in valid_limits:
+            with self.subTest(good_limit=str(good_lim)):
+                res = self.auth_client.get(f"/api/logs?limit={good_lim}")
+                self.assertEqual(res.status_code, 200, f"Valid limit {good_lim} was rejected")
+
+    def test_cors_origin_resolution(self):
+        """Verifies strict CORS origin resolution in production vs dev environments."""
+        old_render = os.environ.get("RENDER")
+        old_env = os.environ.get("ENVIRONMENT")
+        old_cors = os.environ.get("CORS_ALLOWED_ORIGINS")
+
+        try:
+            # Production environment: wildcard rejected, localhost rejected, empty fails safe
+            os.environ["RENDER"] = "true"
+            os.environ["CORS_ALLOWED_ORIGINS"] = ""
+            self.assertEqual(resolve_cors_origins(), [])
+
+            os.environ["CORS_ALLOWED_ORIGINS"] = "*"
+            self.assertEqual(resolve_cors_origins(), [])
+
+            os.environ["CORS_ALLOWED_ORIGINS"] = "https://spotmicro.app, https://*.vercel.app, http://localhost:3000"
+            resolved_prod = resolve_cors_origins()
+            self.assertEqual(resolved_prod, ["https://spotmicro.app"])
+
+            # Dev environment: localhost allowed
+            os.environ.pop("RENDER", None)
+            os.environ["ENVIRONMENT"] = "development"
+            os.environ["CORS_ALLOWED_ORIGINS"] = ""
+            resolved_dev = resolve_cors_origins()
+            self.assertIn("http://localhost:5173", resolved_dev)
+        finally:
+            if old_render is not None:
+                os.environ["RENDER"] = old_render
+            else:
+                os.environ.pop("RENDER", None)
+            if old_env is not None:
+                os.environ["ENVIRONMENT"] = old_env
+            else:
+                os.environ.pop("ENVIRONMENT", None)
+            if old_cors is not None:
+                os.environ["CORS_ALLOWED_ORIGINS"] = old_cors
+            else:
+                os.environ.pop("CORS_ALLOWED_ORIGINS", None)
+
+    def test_secret_key_production_enforcement(self):
+        """Verifies missing or default SECRET_KEY raises in production environment."""
+        old_render = os.environ.get("RENDER")
+        old_key = os.environ.get("SECRET_KEY")
+
+        try:
+            os.environ["RENDER"] = "true"
+            # Missing key
+            os.environ["SECRET_KEY"] = ""
+            with self.assertRaises(RuntimeError):
+                get_secret_key()
+
+            # Insecure default key
+            os.environ["SECRET_KEY"] = "spotmicro-dev-sim-key-9281"
+            with self.assertRaises(RuntimeError):
+                get_secret_key()
+
+            # Valid production key
+            os.environ["SECRET_KEY"] = "super-secret-production-key-999"
+            self.assertEqual(get_secret_key(), "super-secret-production-key-999")
+        finally:
+            if old_render is not None:
+                os.environ["RENDER"] = old_render
+            else:
+                os.environ.pop("RENDER", None)
+            if old_key is not None:
+                os.environ["SECRET_KEY"] = old_key
+            else:
+                os.environ.pop("SECRET_KEY", None)
+
+    def test_security_headers_present(self):
+        """Verifies standard security headers are applied to responses."""
+        res = self.unauth_client.get("/api/health")
+        self.assertEqual(res.headers.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(res.headers.get("X-Frame-Options"), "DENY")
+        self.assertEqual(res.headers.get("Referrer-Policy"), "strict-origin-when-cross-origin")
+
+    def test_socketio_connection_authentication(self):
+        """Verifies WebSocket handshake authentication with auth payload."""
+        # Unauthenticated handshake is refused
+        unauth_sio = socketio.test_client(app)
+        self.assertFalse(unauth_sio.is_connected())
+
+        # Invalid token handshake is refused
+        bad_sio = socketio.test_client(app, auth={"token": "invalid-token-xyz"})
+        self.assertFalse(bad_sio.is_connected())
+
+        # Valid token connects successfully
+        auth_sio = socketio.test_client(app, auth={"token": TEST_OPERATOR_TOKEN})
+        self.assertTrue(auth_sio.is_connected())
+        auth_sio.disconnect()
+        self.assertFalse(auth_sio.is_connected())
+
+    def test_standard_json_error_handlers(self):
+        """Verifies standard JSON error format without stack traces."""
+        # 404 handler
+        res_404 = self.unauth_client.get("/api/non-existent-route")
+        self.assertEqual(res_404.status_code, 404)
+        self.assertEqual(res_404.get_json(), {"error": "Resource not found"})
+
+        # 401 handler
+        res_401 = self.unauth_client.post("/api/commands", json={"command": "forward"})
+        self.assertEqual(res_401.status_code, 401)
+        self.assertEqual(res_401.get_json(), {"error": "Authentication required"})
+
+    def test_h01_x_forwarded_for_spoofing_cannot_bypass_rate_limit(self):
+        """
+        H-01 Regression Test:
+        Verify that changing untrusted client-supplied X-Forwarded-For headers
+        does NOT create new rate-limit identities or bypass rate limiting.
+        """
+        rate_limiter.reset()
+        real_client_ip = "203.0.113.195"
+
+        # Send 5 requests each with a different spoofed prefix IP in X-Forwarded-For
+        for i in range(5):
+            spoofed_hdr = f"198.51.100.{i+1}, {real_client_ip}"
+            res = self.auth_client.post(
+                "/api/commands",
+                json={"command": "forward"},
+                headers={"X-Forwarded-For": spoofed_hdr},
+            )
+            self.assertEqual(res.status_code, 200, f"Request {i+1} failed unexpectedly")
+
+        # 6th request with yet another spoofed IP must be rate-limited (429)
+        res_blocked = self.auth_client.post(
+            "/api/commands",
+            json={"command": "forward"},
+            headers={"X-Forwarded-For": f"198.51.100.99, {real_client_ip}"},
+        )
+        self.assertEqual(res_blocked.status_code, 429)
+        self.assertEqual(res_blocked.get_json(), {"error": "Rate limit exceeded"})
+
+    def test_m02_development_token_fallback_only_in_explicit_dev_or_test(self):
+        """
+        M-02 Regression Test:
+        Verifies development token fallback is allowed ONLY in explicitly declared
+        development or test environments (ENVIRONMENT=development or ENVIRONMENT=test).
+        Production, Pi, Docker, VM, Render, and unknown environments fail closed
+        with a RuntimeError when OPERATOR_API_TOKEN is missing.
+        """
+        old_render = os.environ.get("RENDER")
+        old_env = os.environ.get("ENVIRONMENT")
+        old_flask_env = os.environ.get("FLASK_ENV")
+        old_token = os.environ.get("OPERATOR_API_TOKEN")
+
+        try:
+            # 1. Explicit development environment permits fallback if OPERATOR_API_TOKEN is unset
+            os.environ["ENVIRONMENT"] = "development"
+            os.environ.pop("FLASK_ENV", None)
+            os.environ.pop("RENDER", None)
+            os.environ["OPERATOR_API_TOKEN"] = ""
+            self.assertTrue(is_development_or_test_environment())
+            dev_token = get_operator_token()
+            self.assertTrue(bool(dev_token))
+            self.assertTrue(verify_operator_token(dev_token))
+
+            # 2. Explicit test environment permits fallback if OPERATOR_API_TOKEN is unset
+            os.environ["ENVIRONMENT"] = "test"
+            self.assertTrue(is_development_or_test_environment())
+            test_token = get_operator_token()
+            self.assertTrue(bool(test_token))
+            self.assertTrue(verify_operator_token(test_token))
+
+            # 3. Unknown environment (no env vars set) FAILS CLOSED
+            os.environ.pop("ENVIRONMENT", None)
+            os.environ.pop("FLASK_ENV", None)
+            os.environ.pop("RENDER", None)
+            os.environ["OPERATOR_API_TOKEN"] = ""
+            self.assertFalse(is_development_or_test_environment())
+            with self.assertRaises(RuntimeError):
+                get_operator_token()
+            self.assertFalse(verify_operator_token(dev_token))
+
+            # 4. Custom/non-dev environment (e.g. staging, pi, docker) FAILS CLOSED
+            os.environ["ENVIRONMENT"] = "staging"
+            self.assertFalse(is_development_or_test_environment())
+            with self.assertRaises(RuntimeError):
+                get_operator_token()
+            self.assertFalse(verify_operator_token(dev_token))
+
+            # 5. Production environment (RENDER=true) FAILS CLOSED without real token
+            os.environ["RENDER"] = "true"
+            self.assertFalse(is_development_or_test_environment())
+            with self.assertRaises(RuntimeError):
+                get_operator_token()
+            self.assertFalse(verify_operator_token(dev_token))
+
+            # 6. When real token is configured, it works in all environments
+            real_token = "my-secure-real-operator-token"
+            os.environ["OPERATOR_API_TOKEN"] = real_token
+            self.assertEqual(get_operator_token(), real_token)
+            self.assertTrue(verify_operator_token(real_token))
+            self.assertFalse(verify_operator_token(dev_token))
+        finally:
+            if old_render is not None:
+                os.environ["RENDER"] = old_render
+            else:
+                os.environ.pop("RENDER", None)
+            if old_env is not None:
+                os.environ["ENVIRONMENT"] = old_env
+            else:
+                os.environ.pop("ENVIRONMENT", None)
+            if old_flask_env is not None:
+                os.environ["FLASK_ENV"] = old_flask_env
+            else:
+                os.environ.pop("FLASK_ENV", None)
+            if old_token is not None:
+                os.environ["OPERATOR_API_TOKEN"] = old_token
+            else:
+                os.environ.pop("OPERATOR_API_TOKEN", None)
+
+    def test_l01_boolean_destination_coordinates_rejected(self):
+        """
+        L-01 Regression Test:
+        Verifies that boolean coordinate values (e.g. x: true, y: false) are rejected
+        with HTTP 400 and an error message, rather than silently converted to 1.0/0.0.
+        Normal numeric coordinates continue working.
+        """
+        rate_limiter.reset()
+        # Both boolean
+        res_both = self.auth_client.post(
+            "/api/destination-auto/destination",
+            json={"x": True, "y": False},
+        )
+        self.assertEqual(res_both.status_code, 400)
+        data_both = res_both.get_json()
+        self.assertIn("not boolean", data_both.get("error", "").lower())
+
+        rate_limiter.reset()
+        # x boolean, y float
+        res_x_bool = self.auth_client.post(
+            "/api/destination-auto/destination",
+            json={"x": True, "y": 10.0},
+        )
+        self.assertEqual(res_x_bool.status_code, 400)
+        data_x_bool = res_x_bool.get_json()
+        self.assertIn("not boolean", data_x_bool.get("error", "").lower())
+
+        rate_limiter.reset()
+        # x float, y boolean
+        res_y_bool = self.auth_client.post(
+            "/api/destination-auto/destination",
+            json={"x": 10.0, "y": False},
+        )
+        self.assertEqual(res_y_bool.status_code, 400)
+        data_y_bool = res_y_bool.get_json()
+        self.assertIn("not boolean", data_y_bool.get("error", "").lower())
+
+        rate_limiter.reset()
+        # Normal numeric coordinates continue working
+        res_numeric = self.auth_client.post(
+            "/api/destination-auto/destination",
+            json={"x": 10.0, "y": 10.0},
+        )
+        self.assertEqual(res_numeric.status_code, 200)
+        data_numeric = res_numeric.get_json()
+        self.assertEqual(data_numeric.get("state"), "DESTINATION_SELECTED")
 
 
 if __name__ == "__main__":
