@@ -399,5 +399,293 @@ class TestRobotAgentClient(unittest.TestCase):
             self.assertNotIn(forbidden, sys.modules)
 
 
+class TestFailureAndRecoverySafety(unittest.TestCase):
+    """
+    Stage 2.4 Failure & Recovery Safety Verification Suite
+    Verifies that the Robot Agent fails safely (STOP + SAFE_IDLE) and
+    recovers safely without EVER issuing automatic movement commands.
+    """
+
+    def setUp(self):
+        self.test_token = "valid-stage24-test-token"
+        self.config = RobotAgentConfig(
+            backend_url="https://spotmicro-backend.onrender.com",
+            operator_token=self.test_token,
+            watchdog_timeout_s=0.2,
+            heartbeat_interval_s=0.1,
+        )
+
+    def _create_agent_with_mock_sio(self, connected: bool = True):
+        mock_sio = MagicMock(spec=socketio.Client)
+        mock_sio.connected = connected
+        handlers = {}
+
+        def mock_on(event):
+            def decorator(func):
+                handlers[event] = func
+                return func
+            return decorator
+
+        mock_sio.on.side_effect = mock_on
+        agent = RobotAgent(config=self.config, sio_client=mock_sio)
+        return agent, mock_sio, handlers
+
+    def test_scenario_a_normal_connection_and_telemetry(self):
+        """
+        Scenario A: Normal connection & telemetry processing.
+        Verify DISCONNECTED -> CONNECTING -> CONNECTED -> AUTHENTICATED.
+        Verify heartbeat/telemetry feeds watchdog and robot remains in SAFE_IDLE / STOP.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        self.assertEqual(agent.state, ConnectionState.DISCONNECTED)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+
+        # Connect
+        connected = agent.connect(wait_timeout=2.0)
+        self.assertTrue(connected)
+        self.assertEqual(agent.state, ConnectionState.AUTHENTICATED)
+        self.assertTrue(agent.is_connected)
+
+        # Receive simulation telemetry
+        self.assertIn("telemetry_update", handlers)
+        prev_kick = agent.watchdog.last_kick_time
+        time.sleep(0.02)
+        handlers["telemetry_update"]({"battery_voltage": 12.4, "mode": "simulation"})
+        self.assertGreater(agent.watchdog.last_kick_time, prev_kick)
+        self.assertFalse(agent.watchdog.is_stale)
+
+        # Robot must remain in safe state (STOP)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+        self.assertFalse(agent.safety_authority.hardware_active)
+
+    def test_scenario_b_socketio_disconnect_triggers_stop_and_safe_idle(self):
+        """
+        Scenario B: Unexpected Socket.IO disconnect.
+        Agent must enter DISCONNECTED, trigger STOP, enter SAFE_IDLE,
+        and generate no movement.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent.connect(wait_timeout=2.0)
+
+        # Robot was commanded to forward during active session
+        agent.safety_authority.process_command("forward")
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.FORWARD)
+
+        # Invoke disconnect event callback
+        self.assertIn("disconnect", handlers)
+        handlers["disconnect"]()
+
+        # State must be DISCONNECTED, SafetyAuthority must be SAFE_IDLE / STOP
+        self.assertEqual(agent.state, ConnectionState.DISCONNECTED)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+        self.assertFalse(agent.safety_authority.hardware_active)
+
+    def test_scenario_c_watchdog_timeout_and_recovery(self):
+        """
+        Scenario C: Stale heartbeat/telemetry triggers watchdog timeout.
+        Watchdog expires -> STOP + SAFE_IDLE.
+        Restoring fresh heartbeat -> watchdog recovers, but robot does NOT automatically move.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent.connect(wait_timeout=2.0)
+
+        agent.safety_authority.process_command("forward")
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.FORWARD)
+
+        # Simulate watchdog timeout (stale telemetry)
+        agent._on_watchdog_stale()
+
+        self.assertEqual(agent.state, ConnectionState.SAFE_IDLE)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+        # Restore fresh heartbeat
+        agent.watchdog.feed()
+        self.assertFalse(agent.watchdog.is_stale)
+
+        # Recovery must NEVER automatically resume FORWARD motion!
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+        self.assertFalse(agent.safety_authority.hardware_active)
+
+    def test_scenario_d_backend_interruption_and_recovery(self):
+        """
+        Scenario D: Backend becomes unavailable and subsequently recovers.
+        Failure -> STOP + SAFE_IDLE.
+        Recovery -> Reconnect succeeds, but robot remains safely in STOP.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent.connect(wait_timeout=2.0)
+        agent.safety_authority.process_command("forward")
+
+        # Simulate backend interruption error event
+        self.assertIn("connect_error", handlers)
+        handlers["connect_error"]("Backend server 503 / unreachable")
+
+        self.assertEqual(agent.state, ConnectionState.ERROR)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+        # Reconnection after backend recovery
+        self.assertIn("connect", handlers)
+        handlers["connect"]()
+
+        self.assertEqual(agent.state, ConnectionState.AUTHENTICATED)
+        # Robot MUST remain STOP (no automatic movement upon reconnect)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+    def test_scenario_e_network_failure_and_recovery(self):
+        """
+        Scenario E: Controlled mocked network connection failure.
+        Failure -> STOP + SAFE_IDLE.
+        Recovery -> reconnects safely, zero automatic motion.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=False)
+        # Mock network failure on connect
+        mock_sio.connect.side_effect = socketio.exceptions.ConnectionError("Network interface unreachable")
+
+        success = agent.connect(wait_timeout=1.0)
+
+        self.assertFalse(success)
+        self.assertEqual(agent.state, ConnectionState.ERROR)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+        # Network recovers
+        mock_sio.connect.side_effect = None
+        mock_sio.connected = True
+        success_reconnect = agent.connect(wait_timeout=1.0)
+
+        self.assertTrue(success_reconnect)
+        self.assertEqual(agent.state, ConnectionState.AUTHENTICATED)
+        # Robot remains safely stopped
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+    def test_scenario_f_invalid_token_fails_safely(self):
+        """
+        Scenario F: Invalid/expired operator authentication.
+        Auth failure -> ERROR, STOP, SAFE_IDLE, zero movement, token redacted.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=False)
+        mock_sio.connect.side_effect = socketio.exceptions.ConnectionError("401 Unauthorized: Invalid token")
+
+        success = agent.connect()
+
+        self.assertFalse(success)
+        self.assertEqual(agent.state, ConnectionState.ERROR)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+        self.assertFalse(agent.is_connected)
+
+    def test_scenario_g_process_restart_starts_in_safe_idle(self):
+        """
+        Scenario G: Robot Agent process restart in software.
+        Must initialize in DISCONNECTED, current command STOP, is_safe_idle True.
+        Must NEVER start with a movement command.
+        """
+        # Simulate fresh process startup
+        fresh_agent = RobotAgent(config=self.config)
+        self.assertEqual(fresh_agent.state, ConnectionState.DISCONNECTED)
+        self.assertEqual(fresh_agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(fresh_agent.safety_authority.is_safe_idle)
+        self.assertFalse(fresh_agent.safety_authority.hardware_active)
+        self.assertFalse(fresh_agent.is_connected)
+
+    def test_scenario_h_recovery_never_issues_automatic_movement(self):
+        """
+        Scenario H: Comprehensive verification across all recovery flows.
+        Verifies that after any failure/recovery cycle, the safety state
+        remains STOP until an explicit valid command is received.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent.connect()
+
+        # Step 1: Forward movement commanded
+        agent.safety_authority.process_command("forward")
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.FORWARD)
+
+        # Step 2: Failure occurs (Watchdog timeout)
+        agent._on_watchdog_stale()
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+        # Step 3: Watchdog feeds resume (Recovery 1)
+        agent.watchdog.feed()
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+
+        # Step 4: Disconnect occurs
+        agent.disconnect()
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+
+        # Step 5: Reconnect occurs (Recovery 2)
+        agent.connect()
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+        # Movement ONLY resumes when explicit new command arrives
+        agent.safety_authority.process_command("forward")
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.FORWARD)
+
+    def test_step_3_estop_persistence_across_reconnect_watchdog_and_restart(self):
+        """
+        Step 3: E-stop persistence verification.
+        Triggering E-stop locks the robot in STOP.
+        Reconnecting, watchdog recovery, or process restarts MUST NOT clear E-stop.
+        Only explicit reset_emergency_stop() clears it.
+        """
+        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent.connect()
+
+        # Trigger Emergency Stop
+        agent.safety_authority.trigger_emergency_stop("Manual trigger")
+        self.assertTrue(agent.safety_authority.emergency_stop)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+
+        # 1. Reconnection must NOT clear E-stop
+        self.assertIn("connect", handlers)
+        handlers["connect"]()
+        self.assertTrue(agent.safety_authority.emergency_stop)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+
+        # 2. Watchdog feed/recovery must NOT clear E-stop
+        agent.watchdog.feed()
+        self.assertTrue(agent.safety_authority.emergency_stop)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+
+        # 3. New commands during E-stop must be BLOCKED
+        ok, cmd, msg = agent.safety_authority.process_command("forward")
+        self.assertFalse(ok)
+        self.assertEqual(cmd, NavCommand.STOP)
+        self.assertIn("Emergency Stop is active", msg)
+
+        # 4. Only explicit reset clears it
+        agent.safety_authority.reset_emergency_stop()
+        self.assertFalse(agent.safety_authority.emergency_stop)
+        self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
+        self.assertTrue(agent.safety_authority.is_safe_idle)
+
+    def test_step_4_hardware_isolation_throughout_all_failure_scenarios(self):
+        """
+        Step 4: Hardware isolation throughout all failure & recovery testing.
+        Confirms hardware_active == False and zero hardware library imports.
+        """
+        agent = RobotAgent(config=self.config)
+        self.assertFalse(agent.safety_authority.hardware_active)
+
+        # Trigger multiple state transitions
+        agent.safety_authority.process_command("forward")
+        agent.safety_authority.enter_safe_stop("Test")
+        agent.safety_authority.trigger_emergency_stop("Test")
+        agent.safety_authority.reset_emergency_stop()
+
+        self.assertFalse(agent.safety_authority.hardware_active)
+        for forbidden in ("adafruit_pca9685", "board", "busio", "RPi.GPIO"):
+            self.assertNotIn(forbidden, sys.modules)
+
+
 if __name__ == "__main__":
     unittest.main()
