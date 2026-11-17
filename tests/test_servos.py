@@ -1,4 +1,7 @@
-from hardware.servo_controller import ServoController
+try:
+    from hardware.servo_controller import ServoController
+except ImportError:
+    ServoController = None
 from hardware.config import SERVO_CHANNELS
 
 print("SpotMicro 12-servo configuration")
