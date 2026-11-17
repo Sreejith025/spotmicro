@@ -243,6 +243,209 @@ def run_stage_2_3_probe() -> Dict[str, Any]:
     return results
 
 
+def run_stage_2_4_failure_recovery_probe() -> Dict[str, Any]:
+    """
+    Executes controlled Stage 2.4 Failure & Recovery verification probe:
+    1. Normal connected state
+    2. Socket/transport disconnect
+    3. Watchdog timeout
+    4. Recovery safety (no auto-motion)
+    5. Authentication failure
+    6. Agent restart
+    7. Repeated failure/recovery (multiple cycles)
+    8. Hardware isolation (hardware_active=False)
+    """
+    results: Dict[str, Any] = {
+        "1_normal_connected_state": False,
+        "2_socket_disconnect": False,
+        "3_watchdog_timeout": False,
+        "4_recovery_safety": False,
+        "5_authentication_failure": False,
+        "6_agent_restart": False,
+        "7_repeated_failure_recovery": False,
+        "8_hardware_isolation": False,
+        "overall_verdict": "FAIL",
+        "errors": [],
+    }
+
+    logger.info("=== Starting SpotMicro Stage 2.4 Failure & Recovery Probe ===")
+
+    # 1. Normal Connected State
+    backend_url = os.environ.get("SPOTMICRO_BACKEND_URL", "https://spotmicro-backend.onrender.com").strip()
+    health_url = f"{backend_url.rstrip('/')}/api/health"
+    try:
+        res = requests.get(health_url, timeout=30)
+        if res.status_code == 200:
+            h = res.json()
+            if h.get("status") == "ok" and h.get("mode") == "simulation" and h.get("hardware_active") is False:
+                results["1_normal_connected_state"] = True
+                logger.info("Probe Check 1: Normal Connected State -> PASS (Backend healthy, hardware_active=False)")
+            else:
+                results["errors"].append(f"Unexpected health payload: {h}")
+        else:
+            results["errors"].append(f"Backend returned HTTP {res.status_code}")
+    except Exception as e:
+        results["errors"].append(f"Health check error: {e}")
+
+    # Setup controlled mock Socket.IO for failure injection
+    from unittest.mock import MagicMock
+    import socketio
+
+    test_cfg = RobotAgentConfig(
+        backend_url=backend_url,
+        operator_token="mock-probe-operator-token",
+        watchdog_timeout_s=0.2,
+        heartbeat_interval_s=0.1,
+    )
+
+    handlers = {}
+    def mock_on(event):
+        def decorator(func):
+            handlers[event] = func
+            return func
+        return decorator
+
+    mock_sio = MagicMock(spec=socketio.Client)
+    mock_sio.connected = True
+    mock_sio.on.side_effect = mock_on
+
+    agent = RobotAgent(config=test_cfg, sio_client=mock_sio)
+    agent.connect()
+
+    # 2. Socket/transport disconnect
+    agent.safety_authority.process_command("forward")
+    if "disconnect" in handlers:
+        handlers["disconnect"]()
+        if (
+            agent.state == ConnectionState.DISCONNECTED
+            and agent.safety_authority.current_command == NavCommand.STOP
+            and agent.safety_authority.is_safe_idle is True
+        ):
+            results["2_socket_disconnect"] = True
+            logger.info("Probe Check 2: Socket Disconnect -> PASS (Transitions to DISCONNECTED, STOP, SAFE_IDLE)")
+        else:
+            results["errors"].append("Socket disconnect did not force STOP + SAFE_IDLE")
+    else:
+        results["errors"].append("Disconnect handler not registered")
+
+    # 3. Watchdog timeout
+    # Re-arm forward motion and simulate silence
+    agent.safety_authority.process_command("forward")
+    agent._on_watchdog_stale()
+    if (
+        agent.state == ConnectionState.SAFE_IDLE
+        and agent.safety_authority.current_command == NavCommand.STOP
+        and agent.safety_authority.is_safe_idle is True
+    ):
+        # Restore heartbeat
+        agent.watchdog.feed()
+        if not agent.watchdog.is_stale and agent.safety_authority.current_command == NavCommand.STOP:
+            results["3_watchdog_timeout"] = True
+            logger.info("Probe Check 3: Watchdog Timeout -> PASS (Timeout forces STOP + SAFE_IDLE, feed restores without motion)")
+        else:
+            results["errors"].append("Watchdog recovery issued motion or failed feed")
+    else:
+        results["errors"].append("Watchdog stale callback did not force STOP")
+
+    # 4. Recovery safety
+    # Reconnect after failure
+    if "connect" in handlers:
+        handlers["connect"]()
+        if (
+            agent.state == ConnectionState.AUTHENTICATED
+            and agent.safety_authority.current_command == NavCommand.STOP
+            and agent.safety_authority.is_safe_idle is True
+        ):
+            results["4_recovery_safety"] = True
+            logger.info("Probe Check 4: Recovery Safety -> PASS (Reconnection stays in STOP, zero auto-motion)")
+        else:
+            results["errors"].append("Reconnection altered safety state or issued motion")
+    else:
+        results["errors"].append("Connect handler not registered")
+
+    # 5. Authentication failure
+    auth_fail_sio = MagicMock(spec=socketio.Client)
+    auth_fail_sio.connected = False
+    auth_fail_sio.connect.side_effect = socketio.exceptions.ConnectionError("401 Unauthorized")
+    bad_agent = RobotAgent(config=test_cfg, sio_client=auth_fail_sio)
+    conn_ok = bad_agent.connect()
+    if (
+        not conn_ok
+        and bad_agent.state == ConnectionState.ERROR
+        and bad_agent.safety_authority.current_command == NavCommand.STOP
+        and bad_agent.safety_authority.is_safe_idle is True
+    ):
+        results["5_authentication_failure"] = True
+        logger.info("Probe Check 5: Authentication Failure -> PASS (Rejection yields ERROR, STOP, SAFE_IDLE)")
+    else:
+        results["errors"].append("Authentication failure did not fail closed safely")
+
+    # 6. Agent restart
+    restart_agent = RobotAgent(config=test_cfg)
+    if (
+        restart_agent.state == ConnectionState.DISCONNECTED
+        and restart_agent.safety_authority.current_command == NavCommand.STOP
+        and restart_agent.safety_authority.is_safe_idle is True
+        and not restart_agent.safety_authority.hardware_active
+    ):
+        results["6_agent_restart"] = True
+        logger.info("Probe Check 6: Agent Restart -> PASS (Starts in DISCONNECTED, STOP, SAFE_IDLE)")
+    else:
+        results["errors"].append("Agent restart initialized in non-safe state")
+
+    # 7. Repeated failure/recovery (Cycle 1 & Cycle 2)
+    cycle1_ok = False
+    cycle2_ok = False
+
+    # Cycle 1: Motion -> Disconnect -> Reconnect
+    agent.safety_authority.process_command("forward")
+    handlers["disconnect"]()
+    c1_stopped = (agent.safety_authority.current_command == NavCommand.STOP)
+    handlers["connect"]()
+    c1_recovered = (agent.safety_authority.current_command == NavCommand.STOP and agent.safety_authority.is_safe_idle)
+    if c1_stopped and c1_recovered:
+        cycle1_ok = True
+
+    # Cycle 2: Motion -> Watchdog Timeout -> Fresh Heartbeat -> Reconnect
+    agent.safety_authority.process_command("left")
+    agent._on_watchdog_stale()
+    c2_stopped = (agent.safety_authority.current_command == NavCommand.STOP)
+    agent.watchdog.feed()
+    handlers["connect"]()
+    c2_recovered = (agent.safety_authority.current_command == NavCommand.STOP and agent.safety_authority.is_safe_idle)
+    if c2_stopped and c2_recovered:
+        cycle2_ok = True
+
+    if cycle1_ok and cycle2_ok:
+        results["7_repeated_failure_recovery"] = True
+        logger.info("Probe Check 7: Repeated Failure/Recovery -> PASS (2 consecutive cycles return safely to STOP/SAFE_IDLE)")
+    else:
+        results["errors"].append("Repeated failure/recovery cycle violated safety invariant")
+
+    # 8. Hardware isolation
+    results["8_hardware_isolation"] = _verify_hardware_isolation()
+    if results["8_hardware_isolation"]:
+        logger.info("Probe Check 8: Hardware Isolation -> PASS (hardware_active=False, no forbidden modules)")
+
+    # Overall verdict
+    checks_passed = all(
+        results[k] for k in [
+            "1_normal_connected_state",
+            "2_socket_disconnect",
+            "3_watchdog_timeout",
+            "4_recovery_safety",
+            "5_authentication_failure",
+            "6_agent_restart",
+            "7_repeated_failure_recovery",
+            "8_hardware_isolation",
+        ]
+    )
+
+    results["overall_verdict"] = "PASS" if checks_passed else "FAIL"
+    logger.info(f"=== Stage 2.4 Probe Completed: {results['overall_verdict']} ===")
+    return results
+
+
 def _verify_hardware_isolation() -> bool:
     """Verifies that no hardware libraries or actuator pins were touched."""
     forbidden = ["adafruit_pca9685", "board", "busio", "RPi.GPIO"]
@@ -250,10 +453,10 @@ def _verify_hardware_isolation() -> bool:
         if mod in sys.modules:
             logger.error(f"Hardware isolation VIOLATION: module '{mod}' was imported!")
             return False
-    logger.info("STEP 9 Hardware Isolation: PASS (No hardware modules imported, hardware_active=False)")
+    logger.info("STEP Hardware Isolation: PASS (No hardware modules imported, hardware_active=False)")
     return True
 
 
 if __name__ == "__main__":
-    res = run_stage_2_3_probe()
-    logger.info(f"Stage 2.3 Probe Summary: {res}")
+    res_24 = run_stage_2_4_failure_recovery_probe()
+    logger.info(f"Stage 2.4 Probe Summary: {res_24}")
