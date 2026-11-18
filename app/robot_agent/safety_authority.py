@@ -141,6 +141,13 @@ class LocalSafetyAuthority:
             if self._emergency_stop:
                 self._current_command = NavCommand.STOP
                 self._is_safe_idle = True
+                cmd_val = ""
+                if isinstance(payload, dict):
+                    cmd_val = str(payload.get("command", "")).strip().lower()
+                elif isinstance(payload, str):
+                    cmd_val = payload.strip().lower()
+                if cmd_val == "stop":
+                    return True, NavCommand.STOP, "Command 'STOP' accepted (Emergency Stop active)."
                 return False, NavCommand.STOP, "Emergency Stop is active. Movement blocked."
 
             raw_cmd: Optional[str] = None

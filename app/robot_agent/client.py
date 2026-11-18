@@ -145,6 +145,10 @@ class RobotAgent:
             self._set_state(ConnectionState.AUTHENTICATED)
             self.watchdog.feed()
             logger.info("Socket.IO connection established and authenticated.")
+            try:
+                self.sio.emit("register_robot_agent", {"agent": "pi5", "timestamp": time.time()})
+            except Exception as e:
+                logger.debug(f"Failed to emit register_robot_agent: {e}")
 
         @self.sio.on("disconnect")
         def on_disconnect():
@@ -171,6 +175,12 @@ class RobotAgent:
             self.watchdog.feed()
             self._set_state(ConnectionState.SAFE_IDLE)
             self.safety_authority.trigger_emergency_stop("Backend E-stop broadcast received")
+
+        @self.sio.on("emergency_stop_reset")
+        def on_estop_reset(data=None):
+            self.watchdog.feed()
+            self.safety_authority.reset_emergency_stop()
+            logger.info("Backend emergency stop reset received. Safety authority reset to SAFE_IDLE / STOP.")
 
         @self.sio.on("telemetry_update")
         @self.sio.on("status_update")
@@ -235,9 +245,11 @@ class RobotAgent:
 
         try:
             # Connect via Socket.IO passing auth payload and headers
+            auth_payload = dict(self.config.socketio_auth)
+            auth_payload["client_type"] = "robot_agent"
             self.sio.connect(
                 backend_url,
-                auth=self.config.socketio_auth,
+                auth=auth_payload,
                 headers=self.config.auth_headers,
                 wait_timeout=wait_timeout,
             )
