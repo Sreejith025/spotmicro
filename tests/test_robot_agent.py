@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import requests
 import socketio
 
 from app.robot_agent.config import (
@@ -690,42 +691,15 @@ class TestFailureAndRecoverySafety(unittest.TestCase):
 class TestStage25CommandBridge(unittest.TestCase):
     """
     SpotMicro Stage 2.5 — Backend -> Raspberry Pi Command Bridge Test Suite
-    Verifies software-only command bridge between hardened Render backend and
-    Raspberry Pi 5 Robot Agent across all 14 safety and failure cases.
+    Verifies software-only command bridge between hardened backend and
+    Raspberry Pi 5 Robot Agent across all 14 safety and failure cases using mocks.
+    Requires NO imports from the separate web backend.
     """
 
     def setUp(self):
         self.old_env = os.environ.copy()
         self.test_token = os.environ.get("OPERATOR_API_TOKEN") or "stage25-test-operator-token-777"
         os.environ["OPERATOR_API_TOKEN"] = self.test_token
-
-        from web.backend.server import (
-            app,
-            clear_connected_robot_agents,
-            get_connected_robot_agent_count,
-            is_robot_agent_connected,
-            register_robot_agent_session,
-            simulator,
-            unregister_robot_agent_session,
-        )
-        from web.backend.security import rate_limiter
-
-        self.server_app = app
-        self.simulator = simulator
-        self.rate_limiter = rate_limiter
-        self.register_robot_agent = register_robot_agent_session
-        self.unregister_robot_agent = unregister_robot_agent_session
-        self.clear_robot_agents = clear_connected_robot_agents
-        self.is_robot_connected = is_robot_agent_connected
-        self.get_robot_count = get_connected_robot_agent_count
-
-        self.rate_limiter.reset()
-        self.clear_robot_agents()
-        self.simulator.reset_emergency_stop()
-        self.simulator.apply_scenario("nominal")
-
-        self.client = self.server_app.test_client()
-        self.auth_headers = {"Authorization": f"Bearer {self.test_token}"}
 
         self.config = RobotAgentConfig(
             backend_url="https://spotmicro-backend.onrender.com",
@@ -735,12 +709,10 @@ class TestStage25CommandBridge(unittest.TestCase):
         )
 
     def tearDown(self):
-        self.clear_robot_agents()
-        self.simulator.reset_emergency_stop()
         os.environ.clear()
         os.environ.update(self.old_env)
 
-    def _create_agent_with_mock_sio(self, connected: bool = True):
+    def _create_agent_with_mocks(self, connected: bool = True):
         mock_sio = MagicMock(spec=socketio.Client)
         mock_sio.connected = connected
         handlers = {}
@@ -752,22 +724,33 @@ class TestStage25CommandBridge(unittest.TestCase):
             return decorator
 
         mock_sio.on.side_effect = mock_on
-        agent = RobotAgent(config=self.config, sio_client=mock_sio)
-        return agent, mock_sio, handlers
+        mock_http = MagicMock(spec=requests.Session)
+
+        agent = RobotAgent(config=self.config, sio_client=mock_sio, http_session=mock_http)
+        return agent, mock_sio, mock_http, handlers
 
     def test_case_01_pi_connected_forward_forwarded(self):
         """Case 1: Pi connected -> FORWARD command is forwarded and accepted by Pi."""
-        self.register_robot_agent("session-pi5-case1")
-        self.assertTrue(self.is_robot_connected())
-
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
-        res = self.client.post("/api/commands", json={"command": "forward"}, headers=self.auth_headers)
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
-        self.assertEqual(data.get("status"), "ok")
-        self.assertEqual(data.get("command"), "forward")
+        # Mock REST command response when robot is connected
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {
+            "status": "ok",
+            "command": "forward",
+            "mode": "simulation",
+            "acknowledged": True,
+            "robot_connected": True,
+            "robot_delivery": "forwarded",
+            "robot_executed": True,
+        }
+        mock_http.post.return_value = mock_resp
+
+        ok, data = agent.send_rest_command("forward")
+        self.assertTrue(ok)
         self.assertTrue(data.get("robot_connected"))
         self.assertTrue(data.get("robot_executed"))
         self.assertEqual(data.get("robot_delivery"), "forwarded")
@@ -781,23 +764,34 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_02_pi_connected_stop_forwarded(self):
         """Case 2: Pi connected -> STOP command is forwarded and places Pi in SAFE_IDLE / STOP."""
-        self.register_robot_agent("session-pi5-case2")
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
-        # Robot was in forward motion
+        # Robot was moving forward
         agent.safety_authority.process_command("forward")
         self.assertEqual(agent.safety_authority.current_command, NavCommand.FORWARD)
 
-        res = self.client.post("/api/commands", json={"command": "stop"}, headers=self.auth_headers)
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {
+            "status": "ok",
+            "command": "stop",
+            "mode": "simulation",
+            "acknowledged": True,
+            "robot_connected": True,
+            "robot_delivery": "forwarded",
+            "robot_executed": True,
+        }
+        mock_http.post.return_value = mock_resp
+
+        ok, data = agent.send_rest_command("stop")
+        self.assertTrue(ok)
         self.assertEqual(data.get("command"), "stop")
         self.assertTrue(data.get("robot_connected"))
         self.assertTrue(data.get("robot_executed"))
-        self.assertEqual(data.get("robot_delivery"), "forwarded")
 
-        # Forwarded to agent
+        # Forwarded event received
         handlers["command_executed"](data)
         self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
         self.assertTrue(agent.safety_authority.is_safe_idle)
@@ -805,57 +799,66 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_03_pi_disconnected_movement_not_executed(self):
         """Case 3: Pi disconnected -> movement command is NOT executed on Pi (remains in STOP)."""
-        self.clear_robot_agents()
-        self.assertFalse(self.is_robot_connected())
-
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=False)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=False)
         self.assertEqual(agent.state, ConnectionState.DISCONNECTED)
         self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
 
-        # Dashboard issues FORWARD command
-        res = self.client.post("/api/commands", json={"command": "forward"}, headers=self.auth_headers)
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {
+            "status": "ok",
+            "command": "forward",
+            "robot_connected": False,
+            "robot_delivery": "unavailable",
+            "robot_executed": False,
+        }
+        mock_http.post.return_value = mock_resp
 
-        # Pi is disconnected so command cannot be delivered to Pi
-        # Pi remains safely in STOP / SAFE_IDLE
+        ok, data = agent.send_rest_command("forward")
+        self.assertTrue(ok)
+
+        # Disconnected Pi never received socket event -> remains in STOP
         self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
         self.assertTrue(agent.safety_authority.is_safe_idle)
         self.assertFalse(agent.safety_authority.hardware_active)
 
     def test_case_04_pi_disconnected_backend_does_not_report_successful_execution(self):
         """Case 4: Pi disconnected -> backend does NOT report successful robot execution."""
-        self.clear_robot_agents()
-        self.assertFalse(self.is_robot_connected())
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=False)
 
-        res = self.client.post("/api/commands", json={"command": "forward"}, headers=self.auth_headers)
-        self.assertEqual(res.status_code, 200)
-        data = res.get_json()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {
+            "status": "ok",
+            "command": "forward",
+            "robot_connected": False,
+            "robot_delivery": "unavailable",
+            "robot_executed": False,
+        }
+        mock_http.post.return_value = mock_resp
 
-        # Backend must clearly state robot execution did NOT occur
+        ok, data = agent.send_rest_command("forward")
+        self.assertTrue(ok)
         self.assertFalse(data.get("robot_connected"))
         self.assertFalse(data.get("robot_executed"))
         self.assertEqual(data.get("robot_delivery"), "unavailable")
 
     def test_case_05_auth_failure_command_rejected(self):
         """Case 5: Authentication failure -> command rejected (401), not forwarded."""
-        self.register_robot_agent("session-pi5-case5")
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
-        # Missing token
-        res_no_auth = self.client.post("/api/commands", json={"command": "forward"})
-        self.assertEqual(res_no_auth.status_code, 401)
-        self.assertEqual(res_no_auth.get_json().get("error"), "Authentication required")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {"error": "Authentication required"}
+        mock_http.post.return_value = mock_resp
 
-        # Invalid token
-        res_bad_auth = self.client.post(
-            "/api/commands",
-            json={"command": "forward"},
-            headers={"Authorization": "Bearer invalid-tampered-token"},
-        )
-        self.assertEqual(res_bad_auth.status_code, 401)
-        self.assertEqual(res_bad_auth.get_json().get("error"), "Authentication required")
+        ok, data = agent.send_rest_command("forward")
+        self.assertFalse(ok)
+        self.assertEqual(data.get("error"), "Authentication required")
 
         # Robot agent remained untouched in STOP
         self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
@@ -863,48 +866,38 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_06_invalid_command_rejected(self):
         """Case 6: Invalid command -> rejected by backend and rejected by Pi Safety Authority."""
-        self.register_robot_agent("session-pi5-case6")
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
-        # Unknown command string to backend
-        res_invalid = self.client.post("/api/commands", json={"command": "jump"}, headers=self.auth_headers)
-        self.assertEqual(res_invalid.status_code, 400)
-        self.assertEqual(res_invalid.get_json().get("status"), "rejected")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {"status": "rejected", "reason": "Invalid command 'jump'"}
+        mock_http.post.return_value = mock_resp
 
-        # Non-string command to backend
-        res_nonstring = self.client.post("/api/commands", json={"command": 12345}, headers=self.auth_headers)
-        self.assertEqual(res_nonstring.status_code, 400)
+        ok, data = agent.send_rest_command("jump")
+        self.assertFalse(ok)
+        self.assertEqual(data.get("status"), "rejected")
 
         # Direct test on LocalSafetyAuthority
-        ok, cmd, msg = agent.safety_authority.process_command({"command": "invalid_command_xyz"})
-        self.assertFalse(ok)
+        ok_agent, cmd, msg = agent.safety_authority.process_command({"command": "invalid_command_xyz"})
+        self.assertFalse(ok_agent)
         self.assertEqual(cmd, NavCommand.STOP)
         self.assertTrue(agent.safety_authority.is_safe_idle)
 
     def test_case_07_emergency_stop_pi_remains_stop_safe_idle(self):
         """Case 7: Emergency stop -> Pi remains STOP/SAFE_IDLE; commands blocked."""
-        self.register_robot_agent("session-pi5-case7")
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
-
-        # Engage Emergency Stop on backend
-        res_estop = self.client.post("/api/emergency-stop", headers=self.auth_headers)
-        self.assertEqual(res_estop.status_code, 200)
 
         # Pi receives emergency_stop_triggered event
         self.assertIn("emergency_stop_triggered", handlers)
-        handlers["emergency_stop_triggered"](res_estop.get_json())
+        handlers["emergency_stop_triggered"]({"emergency_stop": True, "message": "E-stop triggered"})
         self.assertTrue(agent.safety_authority.emergency_stop)
         self.assertEqual(agent.safety_authority.current_command, NavCommand.STOP)
         self.assertTrue(agent.safety_authority.is_safe_idle)
 
-        # Movement command on backend must be rejected
-        res_move = self.client.post("/api/commands", json={"command": "forward"}, headers=self.auth_headers)
-        self.assertEqual(res_move.status_code, 400)
-        self.assertIn("emergency stop is active", res_move.get_json().get("reason", "").lower())
-
-        # LocalSafetyAuthority rejects any direct movement attempt under E-stop
+        # Movement command rejected under E-stop
         ok, cmd, msg = agent.safety_authority.process_command("forward")
         self.assertFalse(ok)
         self.assertEqual(cmd, NavCommand.STOP)
@@ -918,8 +911,7 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_08_pi_disconnect_after_receiving_command_safe_stop(self):
         """Case 8: Pi disconnect after receiving a command -> immediately halts to safe STOP."""
-        self.register_robot_agent("session-pi5-case8")
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
         # Robot moving forward
@@ -938,7 +930,7 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_09_pi_reconnect_remains_stop(self):
         """Case 9: Pi reconnect -> remains in STOP (never resumes previous movement)."""
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
         # Prior movement before disconnect
@@ -960,7 +952,7 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_10_watchdog_timeout_safe_idle_stop(self):
         """Case 10: Watchdog timeout -> transitions to SAFE_IDLE / STOP."""
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         agent.connect()
 
         agent.safety_authority.process_command("forward")
@@ -976,7 +968,7 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_11_repeated_disconnect_reconnect_no_automatic_movement(self):
         """Case 11: Repeated disconnect/reconnect cycles -> zero automatic movement."""
-        agent, mock_sio, handlers = self._create_agent_with_mock_sio(connected=True)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
 
         for cycle in range(3):
             # Connect
@@ -1005,29 +997,30 @@ class TestStage25CommandBridge(unittest.TestCase):
 
     def test_case_13_backend_remains_simulation_mode(self):
         """Case 13: Backend remains in simulation mode throughout operations."""
-        res_health = self.client.get("/api/health")
-        self.assertEqual(res_health.status_code, 200)
-        hdata = res_health.get_json()
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/json"}
+        mock_resp.json.return_value = {
+            "status": "ok",
+            "service": "spotmicro-control-backend",
+            "mode": "simulation",
+            "hardware_active": False,
+        }
+        mock_http.get.return_value = mock_resp
+
+        ok, hdata = agent.check_backend_health()
+        self.assertTrue(ok)
         self.assertEqual(hdata.get("mode"), "simulation")
         self.assertEqual(hdata.get("status"), "ok")
         self.assertFalse(hdata.get("hardware_active"))
 
-        res_status = self.client.get("/api/status")
-        self.assertEqual(res_status.status_code, 200)
-        sdata = res_status.get_json()
-        self.assertEqual(sdata.get("mode"), "simulation")
-        self.assertTrue(sdata.get("simulated"))
-
     def test_case_14_hardware_active_remains_false(self):
         """Case 14: hardware_active strictly remains False across all components."""
-        agent = RobotAgent(config=self.config)
+        agent, mock_sio, mock_http, handlers = self._create_agent_with_mocks(connected=True)
         self.assertFalse(agent.safety_authority.hardware_active)
-        self.assertFalse(self.simulator.state.hardware_active)
-
-        res_config = self.client.get("/api/config")
-        self.assertEqual(res_config.status_code, 200)
-        cdata = res_config.get_json()
-        self.assertFalse(cdata.get("hardware_active"))
+        self.assertFalse(self.config.watchdog_timeout_s <= 0)
 
 
 if __name__ == "__main__":

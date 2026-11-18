@@ -219,6 +219,51 @@ class RobotAgent:
             logger.error(f"Failed to reach backend health endpoint: {e}")
             return False, {"error": str(e)}
 
+    def send_rest_command(
+        self,
+        command: str,
+        duration: float = 1.0,
+        speed: float = 1.0,
+        timeout: float = 10.0,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Sends an authenticated high-level command to the backend via POST /api/commands.
+        Uses existing session and auth_headers from config.
+        """
+        if not self.config:
+            return False, {"error": "Missing or invalid configuration"}
+
+        url = f"{self.config.backend_url.rstrip('/')}/api/commands"
+        payload = {
+            "command": command.strip().lower(),
+            "duration": float(duration),
+            "speed": float(speed),
+        }
+        try:
+            res = self.http_session.post(
+                url,
+                headers=self.config.auth_headers,
+                json=payload,
+                timeout=timeout,
+            )
+            data = res.json() if res.headers.get("content-type", "").startswith("application/json") else {"text": res.text, "status_code": res.status_code}
+            return (res.status_code == 200), data
+        except Exception as e:
+            logger.error(f"Failed to send REST command '{command}': {e}")
+            return False, {"error": str(e)}
+
+    def get_backend_status(self, timeout: float = 5.0) -> Tuple[bool, Dict[str, Any]]:
+        """Sends GET /api/status to the web backend via HTTP."""
+        if not self.config:
+            return False, {"error": "Missing or invalid configuration"}
+        url = f"{self.config.backend_url.rstrip('/')}/api/status"
+        try:
+            res = self.http_session.get(url, headers=self.config.auth_headers, timeout=timeout)
+            data = res.json() if res.headers.get("content-type", "").startswith("application/json") else {"text": res.text, "status_code": res.status_code}
+            return (res.status_code == 200), data
+        except Exception as e:
+            return False, {"error": str(e)}
+
     def _heartbeat_worker(self):
         """Background thread emitting periodic pings to keep the connection fresh."""
         interval = self.config.heartbeat_interval_s if self.config else 2.0
